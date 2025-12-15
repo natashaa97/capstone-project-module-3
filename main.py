@@ -130,7 +130,7 @@ def summarize_docs(payload: str):
 
     result = llm.invoke([{"role": "user", "content": prompt}])
 
-    # FIX: AIMessage vs dict
+
     if hasattr(result, "content"):
         return result.content
     return result["messages"][-1].content
@@ -180,7 +180,6 @@ def recommend_by_mood(mood: str):
 
     movies = [clean_doc(d) for d in docs]
 
-    # Header yang rapi, kecil, dan tidak heading besar
     out = (
         f"🎭 **Rekomendasi Film Berdasarkan Mood *{mood.title()}***\n"
         f"------------------------------------------------\n\n"
