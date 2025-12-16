@@ -29,6 +29,7 @@ embeddings = OpenAIEmbeddings(
     api_key=OPENAI_API_KEY,
 )
 
+# Pastikan collection sudah ada
 qdrant = QdrantVectorStore.from_existing_collection(
     embedding=embeddings,
     collection_name="imdb-movies",
@@ -37,32 +38,8 @@ qdrant = QdrantVectorStore.from_existing_collection(
 )
 
 #-------------------------------------------------------        
-# AGENT TOOLS FOR MOVIE EXPERT
+# HELPER FUNCTION
 #-------------------------------------------------------
-
-@tool
-def get_relevant_docs(question: str):
-    """Retrieve movie documents."""
-    results = qdrant.similarity_search(question, k=5)
-    out = []
-
-    for r in results:
-        meta = getattr(r, "metadata", {}) or {}
-        text = getattr(r, "page_content", "")
-
-        out.append({
-            "title": meta.get("Series_Title", "Unknown Title"),
-            "rating": meta.get("IMDB_Rating"),
-            "genre": meta.get("Genre"),
-            "overview": meta.get("Overview") or text[:600]
-        })
-
-    return json.dumps(out, ensure_ascii=False)
-
-
-# ============================================================
-# CLEAN DOC HELPER
-# ============================================================
 
 def clean_doc(r):
     """Normalize movie metadata from Qdrant into a clean dictionary."""
@@ -73,24 +50,48 @@ def clean_doc(r):
         "title": meta.get("Series_Title", "Unknown Title"),
         "rating": float(meta.get("IMDB_Rating", 0) or 0),
         "genre": meta.get("Genre", "Unknown"),
-        "overview": meta.get("Overview") or text[:600]
+        "overview": meta.get("Overview") or text[:600],
+        "year": meta.get("Released_Year", "N/A")
     }
-# ============================================================
+
+#-------------------------------------------------------        
+# AGENT TOOLS - RETURN JSON ONLY
+#-------------------------------------------------------
+
+@tool
+def get_relevant_docs(question: str):
+    """Retrieve movie documents based on search query. Can return up to 20 results."""
+    results = qdrant.similarity_search(question, k=20)
+    
+    out = []
+    for r in results:
+        movie = clean_doc(r)
+        out.append({
+            "title": movie['title'],
+            "rating": movie['rating'],
+            "genre": movie['genre'],
+            "overview": movie['overview'][:300]
+        })
+    
+    return json.dumps(out, ensure_ascii=False)
 
 
 @tool
 def recommend_movies(payload: str):
-    """Recommend movies, accepting JSON or raw string."""
+    """Recommend movies based on query, genre, or year range. Can return up to 20 results based on request."""
     try:
         params = json.loads(payload)
     except:
-        params = {"query": payload, "k": 5}
+        params = {"query": payload, "k": 10}
 
     q = params.get("query", "")
     genre = params.get("genre")
     year_from = params.get("year_from")
     year_to = params.get("year_to")
-    k = params.get("k", 5)
+    k = params.get("k", 10)
+    
+    # Batasi maksimal 20 film
+    k = min(k, 20)
 
     enriched = q
     if genre:
@@ -99,70 +100,45 @@ def recommend_movies(payload: str):
         enriched += f" year:{year_from}-{year_to}"
 
     results = qdrant.similarity_search(enriched, k=k)
+    
     out = []
-
     for r in results:
-        meta = getattr(r, "metadata", {}) or {}
-        text = getattr(r, "page_content", "")
-
+        movie = clean_doc(r)
         out.append({
-            "title": meta.get("Series_Title", "Unknown Title"),
-            "rating": meta.get("IMDB_Rating"),
-            "genre": meta.get("Genre"),
-            "overview": meta.get("Overview") or text[:600]
+            "title": movie['title'],
+            "rating": movie['rating'],
+            "genre": movie['genre'],
+            "overview": movie['overview'][:300]
         })
-
+    
     return json.dumps(out, ensure_ascii=False)
 
 
-
-@tool
-def summarize_docs(payload: str):
-    """Summarize movie list with strong formatting."""
-    try:
-        docs = json.loads(payload)
-    except:
-        return "Invalid summarization payload."
-
-    combined = "\n".join([d.get("overview", "") for d in docs])[:20000]
-
-    prompt = f"Ringkas film berikut menjadi bullet points:\n\n{combined}"
-
-    result = llm.invoke([{"role": "user", "content": prompt}])
-
-
-    if hasattr(result, "content"):
-        return result.content
-    return result["messages"][-1].content
-
 @tool
 def similar_movies(movie_title: str):
-    """Return movies most similar to the given movie title using vector similarity."""
-
-    results = qdrant.similarity_search(movie_title, k=6)
-
-    # Skip the first result because it's usually the same movie
-    movies = [clean_doc(r) for r in results[1:6]]
-
-    out = f"### 🎬 Film yang Mirip Dengan **{movie_title.title()}**\n\n"
-    for i, m in enumerate(movies, 1):
-        out += f"""
-**{i}. {m['title']}** (⭐ {m['rating']})
-Genre: {m['genre']}
-Ringkasan:
-- {m['overview'][:140]}...
----
-"""
-    return out
+    """Return up to 10 movies most similar to the given movie title."""
+    results = qdrant.similarity_search(movie_title, k=11)
+    
+    # Skip first result (usually the same movie)
+    out = []
+    for r in results[1:11]:
+        movie = clean_doc(r)
+        out.append({
+            "title": movie['title'],
+            "rating": movie['rating'],
+            "genre": movie['genre'],
+            "overview": movie['overview'][:250]
+        })
+    
+    return json.dumps(out, ensure_ascii=False)
 
 
 @tool
 def recommend_by_mood(mood: str):
-    """Recommend movies based on emotional mood: healing, cozy, sad, thrilling, inspiring, etc."""
-    
+    """Recommend up to 10 movies based on emotional mood."""
     mood_map = {
         "healing": ["drama", "family"],
-        "cozy": ["romance", "comedy", "feel good"],
+        "cozy": ["romance", "comedy"],
         "sedih": ["drama", "tragedy"],
         "sad": ["drama", "tragedy"],
         "thrilling": ["thriller", "mystery", "crime"],
@@ -176,32 +152,24 @@ def recommend_by_mood(mood: str):
     genres = mood_map.get(mood_key, ["drama"])
 
     query = " ".join([f"genre:{g}" for g in genres])
-    docs = qdrant.similarity_search(query, k=5)
+    docs = qdrant.similarity_search(query, k=10)
 
-    movies = [clean_doc(d) for d in docs]
+    out = []
+    for r in docs:
+        movie = clean_doc(r)
+        out.append({
+            "title": movie['title'],
+            "rating": movie['rating'],
+            "genre": movie['genre'],
+            "overview": movie['overview'][:250]
+        })
 
-    out = (
-        f"🎭 **Rekomendasi Film Berdasarkan Mood *{mood.title()}***\n"
-        f"------------------------------------------------\n\n"
-    )
-
-    for i, m in enumerate(movies, 1):
-        out += (
-            f"**{i}. {m['title']}** (⭐ {m['rating']})\n"
-            f"   Genre: {m['genre']}\n"
-            f"   Ringkasan:\n"
-            f"   - {m['overview'][:150]}...\n"
-            f"---\n"
-        )
-
-    return out
-
-
+    return json.dumps({"mood": mood, "movies": out}, ensure_ascii=False)
 
 
 @tool
 def compare_movies(payload: str):
-    """Compare 2 movies safely."""
+    """Compare 2 movies side by side."""
     try:
         params = json.loads(payload)
     except:
@@ -209,7 +177,7 @@ def compare_movies(payload: str):
         if len(parts) >= 2:
             params = {"movie1": parts[0].strip(), "movie2": parts[1].strip()}
         else:
-            return "Format compare tidak valid."
+            return json.dumps({"error": "Format tidak valid"})
 
     m1 = params["movie1"]
     m2 = params["movie2"]
@@ -217,115 +185,287 @@ def compare_movies(payload: str):
     docs1 = qdrant.similarity_search(m1, k=1)
     docs2 = qdrant.similarity_search(m2, k=1)
 
-    def extract(doc):
-        meta = getattr(doc, "metadata", {}) or {}
-        t = getattr(doc, "page_content", "")
-        return {
-            "title": meta.get("Series_Title"),
-            "rating": meta.get("IMDB_Rating"),
-            "genre": meta.get("Genre"),
-            "year": meta.get("Released_Year"),
-            "overview": meta.get("Overview") or t[:600]
-        }
+    if not docs1 or not docs2:
+        return json.dumps({"error": "Film tidak ditemukan"})
+
+    movie1 = clean_doc(docs1[0])
+    movie2 = clean_doc(docs2[0])
 
     return json.dumps({
-        "movie1": extract(docs1[0]),
-        "movie2": extract(docs2[0])
+        "movie1": movie1,
+        "movie2": movie2
     }, ensure_ascii=False)
 
 
-
 @tool
-def top_movies_by_genre(payload: str):
-    """Return top 5 movies of a genre."""
-    try:
-        params = json.loads(payload)
-        genre = params.get("genre") or payload
-    except:
-        genre = payload
-
+def top_movies_by_genre(genre: str):
+    """Return top 10 highest rated movies of a genre."""
     enriched = f"genre:{genre}"
-    results = qdrant.similarity_search(enriched, k=25)
+    results = qdrant.similarity_search(enriched, k=30)
+
+    movies = [clean_doc(r) for r in results]
+    movies = sorted(movies, key=lambda x: x["rating"], reverse=True)[:10]
 
     out = []
-    for r in results:
-        meta = getattr(r, "metadata", {}) or {}
-        text = getattr(r, "page_content", "")
-
+    for m in movies:
         out.append({
-            "title": meta.get("Series_Title"),
-            "rating": float(meta.get("IMDB_Rating", 0) or 0),
-            "genre": meta.get("Genre"),
-            "overview": meta.get("Overview") or text[:400]
+            "title": m['title'],
+            "rating": m['rating'],
+            "genre": m['genre'],
+            "overview": m['overview'][:250]
         })
 
+    return json.dumps(out, ensure_ascii=False)
+
+
+@tool
+def search_by_person(payload: str):
+    """Search movies by actor or director name. Returns up to 15 movies."""
+    try:
+        params = json.loads(payload)
+        person_name = params.get("name", payload)
+        role = params.get("role", "any")  # actor, director, or any
+    except:
+        person_name = payload
+        role = "any"
     
-    out = sorted(out, key=lambda x: x["rating"], reverse=True)
+    # Search with person name
+    results = qdrant.similarity_search(person_name, k=20)
+    
+    out = []
+    for r in results[:15]:
+        meta = getattr(r, "metadata", {}) or {}
+        
+        # Check if person is in cast or director
+        director = meta.get("Director", "")
+        stars = meta.get("Star1", "") + " " + meta.get("Star2", "") + " " + meta.get("Star3", "") + " " + meta.get("Star4", "")
+        
+        # Filter based on role
+        if role == "director" and person_name.lower() not in director.lower():
+            continue
+        elif role == "actor" and person_name.lower() not in stars.lower():
+            continue
+        
+        movie = clean_doc(r)
+        movie["director"] = director
+        out.append(movie)
+    
+    return json.dumps({"person": person_name, "role": role, "movies": out[:15]}, ensure_ascii=False)
 
-    return json.dumps(out[:5], ensure_ascii=False)
 
+@tool
+def filter_by_rating(payload: str):
+    """Filter movies by rating range. Can specify min and max rating."""
+    try:
+        params = json.loads(payload)
+        min_rating = float(params.get("min", 0))
+        max_rating = float(params.get("max", 10))
+        genre = params.get("genre", "")
+        limit = int(params.get("limit", 10))
+    except:
+        # Parse from string like "above 8.5" or "between 7 and 9"
+        if "above" in payload.lower() or "di atas" in payload.lower():
+            min_rating = float(''.join(filter(lambda x: x.isdigit() or x == '.', payload)))
+            max_rating = 10.0
+        elif "below" in payload.lower() or "di bawah" in payload.lower():
+            min_rating = 0.0
+            max_rating = float(''.join(filter(lambda x: x.isdigit() or x == '.', payload)))
+        else:
+            min_rating = 7.0
+            max_rating = 10.0
+        genre = ""
+        limit = 10
+    
+    # Build query
+    query = genre if genre else "highly rated movies"
+    results = qdrant.similarity_search(query, k=50)
+    
+    # Filter by rating
+    filtered = []
+    for r in results:
+        movie = clean_doc(r)
+        if min_rating <= movie['rating'] <= max_rating:
+            filtered.append(movie)
+    
+    # Sort by rating descending
+    filtered = sorted(filtered, key=lambda x: x['rating'], reverse=True)[:limit]
+    
+    out = []
+    for m in filtered:
+        out.append({
+            "title": m['title'],
+            "rating": m['rating'],
+            "genre": m['genre'],
+            "overview": m['overview'][:250]
+        })
+    
+    return json.dumps({
+        "min_rating": min_rating,
+        "max_rating": max_rating,
+        "count": len(out),
+        "movies": out
+    }, ensure_ascii=False)
+
+
+@tool
+def movies_by_decade(payload: str):
+    """Get top movies from a specific decade (1970s, 1980s, 1990s, 2000s, 2010s, etc)."""
+    try:
+        params = json.loads(payload)
+        decade = params.get("decade", payload)
+        limit = int(params.get("limit", 10))
+    except:
+        decade = payload
+        limit = 10
+    
+    # Extract decade number (e.g., "1990s" -> 1990, "90s" -> 1990)
+    import re
+    decade_match = re.search(r'(\d{2,4})', decade)
+    if decade_match:
+        year = decade_match.group(1)
+        if len(year) == 2:
+            year = "19" + year if int(year) >= 20 else "20" + year
+        decade_start = int(year)
+    else:
+        decade_start = 2000  # default
+    
+    # Search movies from that decade
+    query = f"movies from {decade_start}s"
+    results = qdrant.similarity_search(query, k=50)
+    
+    # Filter by year
+    filtered = []
+    for r in results:
+        meta = getattr(r, "metadata", {}) or {}
+        year = meta.get("Released_Year", "")
+        
+        try:
+            year_int = int(year) if year else 0
+            if decade_start <= year_int < decade_start + 10:
+                movie = clean_doc(r)
+                filtered.append(movie)
+        except:
+            continue
+    
+    # Sort by rating
+    filtered = sorted(filtered, key=lambda x: x['rating'], reverse=True)[:limit]
+    
+    out = []
+    for m in filtered:
+        out.append({
+            "title": m['title'],
+            "rating": m['rating'],
+            "genre": m['genre'],
+            "year": m['year'],
+            "overview": m['overview'][:250]
+        })
+    
+    return json.dumps({
+        "decade": f"{decade_start}s",
+        "count": len(out),
+        "movies": out
+    }, ensure_ascii=False)
+
+
+@tool
+def movies_by_country(payload: str):
+    """Find movies from a specific country or region (Korea, Japan, USA, India, etc)."""
+    try:
+        params = json.loads(payload)
+        country = params.get("country", payload)
+        limit = int(params.get("limit", 10))
+    except:
+        country = payload
+        limit = 10
+    
+    # Country keyword mapping
+    country_keywords = {
+        "korea": ["korean", "korea"],
+        "japan": ["japanese", "japan", "anime"],
+        "india": ["indian", "bollywood", "india"],
+        "usa": ["american", "hollywood", "usa"],
+        "uk": ["british", "uk", "england"],
+        "france": ["french", "france"],
+        "china": ["chinese", "china", "hong kong"],
+        "italy": ["italian", "italy"],
+        "spain": ["spanish", "spain"],
+        "germany": ["german", "germany"]
+    }
+    
+    # Get search keywords
+    search_key = country.lower()
+    keywords = country_keywords.get(search_key, [country])
+    
+    # Search with country keywords
+    query = f"{' '.join(keywords)} cinema movies"
+    results = qdrant.similarity_search(query, k=30)
+    
+    out = []
+    for r in results[:limit]:
+        movie = clean_doc(r)
+        out.append({
+            "title": movie['title'],
+            "rating": movie['rating'],
+            "genre": movie['genre'],
+            "year": movie['year'],
+            "overview": movie['overview'][:250]
+        })
+    
+    return json.dumps({
+        "country": country,
+        "count": len(out),
+        "movies": out
+    }, ensure_ascii=False)
 
 
 tools = [
     get_relevant_docs,
     recommend_movies,
-    summarize_docs,
+    similar_movies,
     compare_movies,
     top_movies_by_genre,
     recommend_by_mood,
-    similar_movies
+    search_by_person,
+    filter_by_rating,
+    movies_by_decade,
+    movies_by_country
 ]
 
 
-def chat_movie_expert(question: str):
+#-------------------------------------------------------
+# MAIN CHAT FUNCTION (Logic Original User)
+#-------------------------------------------------------
 
-    system_prompt = """
-Kamu adalah Autonomous Movie Expert.
+def chat_movie_expert(question, history):
+    """Main function to handle movie expert chatbot."""
 
-=== GUNAKAN FORMAT INI 100% SAMA SETIAP KALI ===
+    system_prompt = """You are a movie expert assistant. When presenting movies:
 
-1. Oldboy (Rating: 8.4)
-   Genre: Action, Mystery, Thriller
-   Ringkasan:
-   - Seorang pria dikurung selama 15 tahun tanpa alasan jelas.
-   - Setelah bebas, ia mencari dalang di balik penderitaannya.
+**Standard Format:**
+**[Number]. [Title]** (⭐ [Rating])
+- **Genre:** [Genre]
+- **Ringkasan:** [Brief overview]
 ---
 
-2. The Chaser (Rating: 7.9)
-   Genre: Crime, Thriller
-   Ringkasan:
-   - Mantan detektif mengejar pembunuh berantai.
-   - Cerita intens dan penuh ketegangan.
----
+**Comparison Format:**
+| Aspek | Film 1 | Film 2 |
+|-------|--------|--------|
+| Rating | ⭐ X.X | ⭐ X.X |
+| Genre | ... | ... |
 
-RULE WAJIB:
-- Tiap film HARUS bernomor (1., 2., 3., ...)
-- Rating selalu dalam format (Rating: X.X)
-- Genre HARUS baris baru
-- Ringkasan HARUS bullet points "- "
-- Antar film HARUS dipisahkan '---'
-- Tidak boleh paragraf panjang
-- Tidak boleh JSON mentah
-- Output harus bersih, rapi, estetis
+**Rules:**
+- Always use tools for movie data
+- Return exactly N movies when user specifies quantity
+- Use consistent markdown formatting
+- Answer in user's language
+- Tools support up to 20 movies per request
 
-FORMAT COMPARE:
-Judul 1 vs Judul 2
-Rating:
-- Judul 1: X.X
-- Judul 2: X.X
-
-Genre:
-- Judul 1: ...
-- Judul 2: ...
-
-Ringkasan:
-- poin 1
-- poin 2
-
-FORMAT TOP GENRE:
-Gunakan format list film di atas.
-
-Gunakan data dari tools secara akurat.
+**Available Search Options:**
+- By genre, mood, or similarity
+- By actor or director name
+- By rating range (e.g., "above 8.5")
+- By decade (e.g., "1990s movies")
+- By country (e.g., "Korean cinema")
 """
 
     agent = create_agent(
@@ -334,85 +474,127 @@ Gunakan data dari tools secara akurat.
         system_prompt=system_prompt
     )
 
-    result = agent.invoke({"messages": [{"role": "user", "content": question}]})
+    # Structured prompt 
+    result = agent.invoke({
+        "messages": history + [{"role": "user", "content": question}]
+    })
 
+    answer = result["messages"][-1].content
 
-    # FIX: AIMessage or dict
-    if hasattr(result, "content"):
-        answer = result.content
-    else:
-        answer = result["messages"][-1].content
+    # Token usage calculation (Sesuai kode user)
+    total_input_tokens = 0
+    total_output_tokens = 0
 
-    # Token usage tracking
-    total_in = 0
-    total_out = 0
-    tool_msgs = []
-
-    for m in result.get("messages", []) if isinstance(result, dict) else []:
-        if isinstance(m, ToolMessage):
-            tool_msgs.append(m.content)
-
-        meta = getattr(m, "response_metadata", {})
+    for message in result["messages"]:
+        # Cek berbagai kemungkinan format metadata
+        meta = message.response_metadata
         if "usage_metadata" in meta:
-            total_in += meta["usage_metadata"].get("input_tokens", 0)
-            total_out += meta["usage_metadata"].get("output_tokens", 0)
+            total_input_tokens += meta["usage_metadata"].get("input_tokens", 0)
+            total_output_tokens += meta["usage_metadata"].get("output_tokens", 0)
+        elif "token_usage" in meta:
+            total_input_tokens += meta["token_usage"].get("prompt_tokens", 0)
+            total_output_tokens += meta["token_usage"].get("completion_tokens", 0)
 
-    price = 17000 * (total_in * 0.15 + total_out * 0.6) / 1_000_000
+    price = 17_000 * (total_input_tokens * 0.15 + total_output_tokens * 0.6) / 1_000_000
+
+    tool_messages = []
+    tool_names = []
+    
+    for msg in result["messages"]:
+        if isinstance(msg, ToolMessage):
+            tool_messages.append(msg.content)
+            # Get tool name from the message if available
+            if hasattr(msg, 'name'):
+                tool_names.append(msg.name)
 
     return {
         "answer": answer,
-        "tool_messages": tool_msgs,
-        "total_input_tokens": total_in,
-        "total_output_tokens": total_out,
-        "price": price
+        "price": price,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "tool_messages": tool_messages,
+        "tool_names": tool_names
     }
 
 
 #-------------------------------------------------------
-# STREAMLIT CHAT INTERFACE
+# STREAMLIT CHAT INTERFACE 
 #-------------------------------------------------------
 
-st.title("🎬 Movie Expert Chat Bot")
-# st.image("./Movie Expert/header_img.png")
+st.set_page_config(page_title="Movie Expert", page_icon="🎬")
+st.title("🎬 Movie Expert Chatbot")
 
+# Initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Show chat history
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+# Initialize recently asked questions (max 5)
+if "recent_queries" not in st.session_state:
+    st.session_state.recent_queries = []
 
-prompt = st.chat_input("Tanyakan apa saja tentang film…")
+# Sidebar: Recently Asked
+with st.sidebar:
+    st.subheader("🕒 Recently Asked")
+    if st.session_state.recent_queries:
+        for q in reversed(st.session_state.recent_queries):
+            st.markdown(f"- {q}")
+    else:
+        st.write("Belum ada pertanyaan.")
 
-if prompt:
-    st.session_state.messages.append({"role": "Human", "content": prompt})
+# Display chat messages from history on app rerun
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
+# Accept user input
+if prompt := st.chat_input("Tanyakan tentang film..."):
+    # Save to recent queries
+    st.session_state.recent_queries.append(prompt)
+    st.session_state.recent_queries = st.session_state.recent_queries[-5:]
+
+    # Build history (last 20 messages)
+    messages_history = st.session_state.get("messages", [])[-20:]
+    
+    # Convert to LangChain format
+    history = []
+    for msg in messages_history:
+        role = "user" if msg["role"] == "Human" else "assistant"
+        history.append({"role": role, "content": msg["content"]})
+    
+    # Display user message
     with st.chat_message("Human"):
         st.markdown(prompt)
-
+    
+    st.session_state.messages.append({"role": "Human", "content": prompt})
+    
+    # Assistant response
     with st.chat_message("AI"):
-        response = chat_movie_expert(prompt)
+        with st.spinner("🎬 Sedang memilih film terbaik untukmu... 🍿"):
+            response = chat_movie_expert(prompt, history)
+            answer = response["answer"]
+            st.markdown(answer)
+            st.session_state.messages.append({"role": "AI", "content": answer})
 
-        final_text = response["answer"]
+            # ------------------------------------------------------------------
+            # UI UPDATE: TOOLS & METRICS
+            # ------------------------------------------------------------------
+            
+            # 1. Menampilkan Nama Tools yang Digunakan
+            if response["tool_names"]:
+                unique_tools = list(set(response['tool_names']))
+                st.info(f"🛠️ Tools yang digunakan: **{', '.join(unique_tools)}**")
 
-        box = st.empty()
-        streamed = ""
+            # 2. Estimasi Biaya & Token + Chart
+            with st.expander("💰 Estimasi Biaya & Token"):
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Input Tokens", response["total_input_tokens"])
+                col2.metric("Output Tokens", response["total_output_tokens"])
+                col3.metric("Biaya (Rp)", f"{response['price']:.2f}")
 
-        for w in final_text.split():
-            streamed += w + " "
-            box.markdown(streamed)
-            time.sleep(0.018)
-
-        st.session_state.messages.append({"role": "AI", "content": final_text})
-
-    if response["tool_messages"]:
-        with st.expander("Tool Calls"):
-            st.code(response["tool_messages"])
-
-    with st.expander("Usage Details"):
-        st.code(
-            f"Input tokens : {response['total_input_tokens']}\n"
-            f"Output tokens: {response['total_output_tokens']}\n"
-            f"Estimated cost: Rp {response['price']:.4f}"
-        )
+                # Token Usage Chart
+                import pandas as pd
+                chart_data = pd.DataFrame({
+                    "Tokens": ["Input Tokens", "Output Tokens"],
+                    "Jumlah": [response["total_input_tokens"], response["total_output_tokens"]]
+                })
+                st.bar_chart(chart_data, x="Tokens", y="Jumlah")
