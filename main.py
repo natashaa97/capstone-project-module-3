@@ -10,11 +10,24 @@ QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY")
+LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY")
+LANGFUSE_BASE_URL = os.getenv("LANGFUSE_BASE_URL", "https://us.cloud.langfuse.com")
+
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain.tools import tool
 from langchain.agents import create_agent
 from langchain_core.messages import ToolMessage
+from langfuse.langchain import CallbackHandler
+
+# Initialize Langfuse Handler
+try:
+   langfuse_handler = CallbackHandler()
+   print("✅ Langfuse initialized successfully!")
+except Exception as e:
+    print(f"⚠️ Langfuse initialization failed: {e}")
+    langfuse_handler = None
 
 #-------------------------------------------------------
 # Vector Store Setup & LLM Initialization 
@@ -55,7 +68,7 @@ def clean_doc(r):
     }
 
 #-------------------------------------------------------        
-# AGENT TOOLS - RETURN JSON ONLY
+# AGENT TOOLS 
 #-------------------------------------------------------
 
 @tool
@@ -119,7 +132,6 @@ def similar_movies(movie_title: str):
     """Return up to 10 movies most similar to the given movie title."""
     results = qdrant.similarity_search(movie_title, k=11)
     
-    # Skip first result (usually the same movie)
     out = []
     for r in results[1:11]:
         movie = clean_doc(r)
@@ -433,7 +445,7 @@ tools = [
 
 
 #-------------------------------------------------------
-# MAIN CHAT FUNCTION (Logic Original User)
+# MAIN CHAT FUNCTION
 #-------------------------------------------------------
 
 def chat_movie_expert(question, history):
@@ -474,14 +486,25 @@ def chat_movie_expert(question, history):
         system_prompt=system_prompt
     )
 
+# Add Langfuse callback if available
+    config = {}
+    if langfuse_handler:
+        config["callbacks"] = [langfuse_handler]
+        config["run_name"] = f"Movie Query: {question[:50]}"  # Track query name
+        config["metadata"] = {
+            "user_query": question,
+            "conversation_length": len(history)
+        }
+
     # Structured prompt 
-    result = agent.invoke({
-        "messages": history + [{"role": "user", "content": question}]
-    })
+    result = agent.invoke(
+        {"messages": history + [{"role": "user", "content": question}]},
+        config=config if config else None
+    )
 
     answer = result["messages"][-1].content
 
-    # Token usage calculation (Sesuai kode user)
+    # Token usage calculation
     total_input_tokens = 0
     total_output_tokens = 0
 
